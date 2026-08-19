@@ -58,3 +58,36 @@ student (`16.5245s/video`) and 54.48x faster than the 40-step teacher
 `topk=0.3` was selected as the practical speed/quality setting from paired
 visual comparisons; sparse attention is not numerically lossless and should be
 revalidated for a different resolution or prompt distribution.
+
+## RTX PRO 6000 Blackwell / SM120 Notes
+
+On RTX PRO 6000 Blackwell Server Edition (`sm120`), the same full inference
+stack is supported, but two runtime differences are required for stable
+high-resolution runs:
+
+- PyTorch allocator fragmentation can cause a late OOM at `1024x1792` even
+  when total reserved memory is sufficient. Use
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for this workload.
+- TileLang's H20-oriented default `BLOCK_K=128` exceeds the dynamic shared
+  memory limit for some Blackwell kernels. The TileLang post-scale W8A8 layer
+  now defaults to `BLOCK_K=64` on compute capability 12.x and newer.
+
+The SM120 path also defaults SageSLA to the FP32 accumulation sparse-attention
+branch, which is slightly faster than the Sage2++ FP16 accumulation branch on
+the tested Blackwell system. These defaults can still be overridden with:
+
+```bash
+export TURBOT2AV_TILELANG_W8A8_BLOCK_K=128
+export TURBOT2AV_SAGESLA_ACCUM=f16
+```
+
+For peak-memory-sensitive runs, `--preencode_text` encodes prompts before
+loading the generator and then releases the Gemma text encoder. This changes
+model-loading memory scheduling only; it does not disable SageSLA, W8A8, or
+FastNorm.
+
+On one RTX PRO 6000 Blackwell Server Edition with the full stack, `topk=0.3`,
+text trimming, `--preencode_text`, and generator-only timing, the validated
+`1024x1792`, 121-frame student latency was `9.36s/video` after one warmup
+sample. The unaccelerated four-step student on the same machine was
+`23.22s/video`, giving a `2.48x` per-step inference-stack speedup.

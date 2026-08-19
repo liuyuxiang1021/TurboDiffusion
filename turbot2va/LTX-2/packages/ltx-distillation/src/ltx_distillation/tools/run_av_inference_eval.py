@@ -164,6 +164,42 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _reset_accel_profiles_if_enabled() -> None:
+    if not _env_flag("TURBOT2AV_PROFILE_ACCEL", False):
+        return
+    try:
+        from ltx_distillation.acceleration import reset_acceleration_profile
+
+        reset_acceleration_profile()
+    except Exception as exc:
+        print(f"[AVEval][profile] failed to reset acceleration profile: {exc}", flush=True)
+    try:
+        from ltx_distillation.tilelang_w8a8 import reset_tilelang_w8a8_profile
+
+        reset_tilelang_w8a8_profile()
+    except Exception as exc:
+        print(f"[AVEval][profile] failed to reset TileLang W8A8 profile: {exc}", flush=True)
+
+
+def _accel_profile_snapshot_if_enabled() -> dict[str, Any] | None:
+    if not _env_flag("TURBOT2AV_PROFILE_ACCEL", False):
+        return None
+    snapshot: dict[str, Any] = {}
+    try:
+        from ltx_distillation.acceleration import acceleration_profile_snapshot
+
+        snapshot["acceleration"] = acceleration_profile_snapshot()
+    except Exception as exc:
+        snapshot["acceleration_error"] = str(exc)
+    try:
+        from ltx_distillation.tilelang_w8a8 import tilelang_w8a8_profile_snapshot
+
+        snapshot["tilelang_w8a8"] = tilelang_w8a8_profile_snapshot()
+    except Exception as exc:
+        snapshot["tilelang_w8a8_error"] = str(exc)
+    return snapshot
+
+
 def _make_registry(cache_state_dicts: bool):
     if cache_state_dicts:
         return StateDictRegistry()
@@ -492,6 +528,16 @@ def parse_args() -> argparse.Namespace:
         help="Drop padded text tokens before inference. Disabled unless explicitly requested.",
     )
     parser.add_argument(
+        "--preencode_text",
+        action="store_true",
+        default=False,
+        help=(
+            "Encode selected prompts before loading the generator, then release "
+            "the text encoder. This reduces peak VRAM for full acceleration runs "
+            "without changing generator kernels."
+        ),
+    )
+    parser.add_argument(
         "--quant_linear",
         action="store_true",
         default=False,
@@ -618,9 +664,35 @@ def main() -> None:
         gemma_path=str(getattr(cfg, "gemma_path", "")),
     )
     force_trig = False
+    negative_prompt = str(cfg.negative_prompt)
+    preencoded_conditioning: dict[int, dict[str, torch.Tensor]] | None = None
+    preencoded_unconditional: dict[str, torch.Tensor] | None = None
+    text_encoder = None
 
     with _model_init_lock(init_lock_path, args.shard_id):
         registry = _make_registry(cache_state_dicts)
+
+        if args.preencode_text:
+            print("[AVEval] preencoding text prompts before generator init", flush=True)
+            text_encoder = create_text_encoder_wrapper(
+                checkpoint_path=cfg.checkpoint_path,
+                gemma_path=cfg.gemma_path,
+                device=device,
+                dtype=dtype,
+                registry=registry,
+            ).eval()
+            preencoded_conditioning = {
+                prompt_idx: text_encoder(text_prompts=[prompts[prompt_idx]])
+                for prompt_idx in indices
+            }
+            if args.model_kind == "teacher":
+                preencoded_unconditional = text_encoder(text_prompts=[negative_prompt])
+            del text_encoder
+            text_encoder = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device)
+            print("[AVEval] released text encoder after preencoding", flush=True)
 
         if args.model_kind == "teacher":
             force_trig = args.teacher_mode == "rcm_trig"
@@ -666,14 +738,16 @@ def main() -> None:
             sla_block_k=args.sla_block_k,
         )
         print(acceleration_report.format(), flush=True)
+        _reset_accel_profiles_if_enabled()
 
-        text_encoder = create_text_encoder_wrapper(
-            checkpoint_path=cfg.checkpoint_path,
-            gemma_path=cfg.gemma_path,
-            device=device,
-            dtype=dtype,
-            registry=registry,
-        ).eval()
+        if text_encoder is None and preencoded_conditioning is None:
+            text_encoder = create_text_encoder_wrapper(
+                checkpoint_path=cfg.checkpoint_path,
+                gemma_path=cfg.gemma_path,
+                device=device,
+                dtype=dtype,
+                registry=registry,
+            ).eval()
         video_vae = None
         audio_vae = None
         if not args.skip_decode:
@@ -710,18 +784,24 @@ def main() -> None:
             use_trigflow=force_trig,
         )
 
-    negative_prompt = str(cfg.negative_prompt)
     if args.warmup_samples > 0 and indices:
         print(f"[AVEval] warmup_samples={args.warmup_samples}", flush=True)
         for warmup_idx in range(int(args.warmup_samples)):
             prompt_idx = indices[warmup_idx % len(indices)]
             prompt = prompts[prompt_idx]
-            conditional_dict = text_encoder(text_prompts=[prompt])
-            unconditional_dict = (
-                text_encoder(text_prompts=[negative_prompt])
-                if args.model_kind == "teacher"
-                else None
+            conditional_dict = (
+                preencoded_conditioning[prompt_idx]
+                if preencoded_conditioning is not None
+                else text_encoder(text_prompts=[prompt])
             )
+            if args.model_kind == "teacher":
+                unconditional_dict = (
+                    preencoded_unconditional
+                    if preencoded_conditioning is not None
+                    else text_encoder(text_prompts=[negative_prompt])
+                )
+            else:
+                unconditional_dict = None
             prompt_seed = int(args.seed) + warmup_idx
             with torch.random.fork_rng(devices=[device]):
                 torch.manual_seed(prompt_seed)
@@ -762,6 +842,7 @@ def main() -> None:
                 f"gen={warmup_elapsed:.2f}s",
                 flush=True,
             )
+        _reset_accel_profiles_if_enabled()
 
     start = time.perf_counter()
     total_tasks = len(indices) * int(args.num_seeds)
@@ -769,12 +850,19 @@ def main() -> None:
     timing_records: list[dict[str, Any]] = []
     for local_prompt_pos, prompt_idx in enumerate(indices, start=1):
         prompt = prompts[prompt_idx]
-        conditional_dict = text_encoder(text_prompts=[prompt])
-        unconditional_dict = (
-            text_encoder(text_prompts=[negative_prompt])
-            if args.model_kind == "teacher"
-            else None
+        conditional_dict = (
+            preencoded_conditioning[prompt_idx]
+            if preencoded_conditioning is not None
+            else text_encoder(text_prompts=[prompt])
         )
+        if args.model_kind == "teacher":
+            unconditional_dict = (
+                preencoded_unconditional
+                if preencoded_conditioning is not None
+                else text_encoder(text_prompts=[negative_prompt])
+            )
+        else:
+            unconditional_dict = None
 
         for seed_idx in range(int(args.num_seeds)):
             if args.same_seed_for_all_prompts:
@@ -898,18 +986,18 @@ def main() -> None:
     if timing_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(timing_path)), exist_ok=True)
         generator_times = [record["generator_seconds"] for record in timing_records]
+        timing_payload = {
+            "args": vars(args),
+            "num_records": len(timing_records),
+            "mean_generator_seconds": float(np.mean(generator_times)) if generator_times else None,
+            "median_generator_seconds": float(np.median(generator_times)) if generator_times else None,
+            "records": timing_records,
+        }
+        accel_profile = _accel_profile_snapshot_if_enabled()
+        if accel_profile is not None:
+            timing_payload["accel_profile"] = accel_profile
         with open(timing_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "args": vars(args),
-                    "num_records": len(timing_records),
-                    "mean_generator_seconds": float(np.mean(generator_times)) if generator_times else None,
-                    "median_generator_seconds": float(np.median(generator_times)) if generator_times else None,
-                    "records": timing_records,
-                },
-                f,
-                indent=2,
-            )
+            json.dump(timing_payload, f, indent=2)
         print(f"[AVEval][timing] wrote {timing_path}", flush=True)
     print(
         f"[AVEval] done kind={args.model_kind} shard={args.shard_id}/{args.num_shards} "

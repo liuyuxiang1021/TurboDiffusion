@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import time
+from collections import Counter, defaultdict
+from typing import Any
 
 import tilelang
 import tilelang.language as T
@@ -11,6 +14,70 @@ import triton.language as tl
 
 _ROW_QUANT_WORKSPACES: dict[tuple[str, int | None, torch.dtype, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 _PAD_WORKSPACES: dict[tuple[str, int | None, torch.dtype, int, int], torch.Tensor] = {}
+_PROFILE: dict[str, Any] = {
+    "calls": 0,
+    "tilelang_calls": 0,
+    "fallback_calls": 0,
+    "fallback_reasons": Counter(),
+    "input_shapes": Counter(),
+    "tilelang_shapes": Counter(),
+    "fallback_shapes": Counter(),
+    "kernel_params": Counter(),
+    "elapsed_seconds": defaultdict(float),
+}
+
+
+def _profile_enabled() -> bool:
+    return os.environ.get("TURBOT2AV_PROFILE_ACCEL", "").lower() in {"1", "true", "yes"}
+
+
+def _profile_events_enabled() -> bool:
+    return os.environ.get("TURBOT2AV_PROFILE_CUDA_EVENTS", "").lower() in {"1", "true", "yes"}
+
+
+def _is_sm120_or_newer() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception:
+        return False
+    return major >= 12
+
+
+def reset_tilelang_w8a8_profile() -> None:
+    _PROFILE["calls"] = 0
+    _PROFILE["tilelang_calls"] = 0
+    _PROFILE["fallback_calls"] = 0
+    _PROFILE["fallback_reasons"].clear()
+    _PROFILE["input_shapes"].clear()
+    _PROFILE["tilelang_shapes"].clear()
+    _PROFILE["fallback_shapes"].clear()
+    _PROFILE["kernel_params"].clear()
+    _PROFILE["elapsed_seconds"].clear()
+
+
+def tilelang_w8a8_profile_snapshot() -> dict[str, Any]:
+    return {
+        "calls": _PROFILE["calls"],
+        "tilelang_calls": _PROFILE["tilelang_calls"],
+        "fallback_calls": _PROFILE["fallback_calls"],
+        "fallback_reasons": dict(_PROFILE["fallback_reasons"]),
+        "input_shapes": dict(_PROFILE["input_shapes"].most_common()),
+        "tilelang_shapes": dict(_PROFILE["tilelang_shapes"].most_common()),
+        "fallback_shapes": dict(_PROFILE["fallback_shapes"].most_common()),
+        "kernel_params": dict(_PROFILE["kernel_params"].most_common()),
+        "elapsed_seconds": dict(_PROFILE["elapsed_seconds"]),
+    }
+
+
+def _shape_key(m: int, k: int, n: int) -> str:
+    return f"m={m},k={k},n={n}"
+
+
+def _record_elapsed(bucket: str, start: float) -> None:
+    if _profile_enabled():
+        _PROFILE["elapsed_seconds"][bucket] += time.perf_counter() - start
 
 
 @triton.jit
@@ -140,10 +207,11 @@ class TileLangPostScaleInt8Linear(torch.nn.Module):
 
     @staticmethod
     def _block_params() -> tuple[int, int, int, int, int, int]:
+        default_block_k = "64" if _is_sm120_or_newer() else "128"
         return (
             int(os.environ.get("TURBOT2AV_TILELANG_W8A8_BLOCK_M", "128")),
             int(os.environ.get("TURBOT2AV_TILELANG_W8A8_BLOCK_N", "256")),
-            int(os.environ.get("TURBOT2AV_TILELANG_W8A8_BLOCK_K", "128")),
+            int(os.environ.get("TURBOT2AV_TILELANG_W8A8_BLOCK_K", default_block_k)),
             int(os.environ.get("TURBOT2AV_TILELANG_W8A8_THREADS", "256")),
             int(os.environ.get("TURBOT2AV_TILELANG_W8A8_STAGES", "4")),
             int(os.environ.get("TURBOT2AV_TILELANG_W8A8_K_PACK", "2")),
@@ -165,12 +233,33 @@ class TileLangPostScaleInt8Linear(torch.nn.Module):
             self._kernel_cache[key] = kernel
         return kernel
 
+    def _effective_kernel_params(self, m: int, k: int) -> tuple[int, int, int, int, int, int]:
+        block_m, block_n, block_k, threads, num_stages, k_pack = self._block_params()
+        if m % block_m != 0:
+            block_m = 128
+        if self.out_features % block_n != 0:
+            block_n = 128
+        if k % block_k != 0:
+            block_k = 128
+        return block_m, block_n, block_k, threads, num_stages, k_pack
+
     @staticmethod
     def _pad_m_enabled() -> bool:
         return os.environ.get("TURBOT2AV_TILELANG_W8A8_PAD_M", "").lower() in {"1", "true", "yes"}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        profile_start = time.perf_counter()
         if x.dtype != torch.bfloat16 or not x.is_cuda:
+            if _profile_enabled():
+                _PROFILE["calls"] += 1
+                _PROFILE["fallback_calls"] += 1
+                reason = "dtype_or_device"
+                _PROFILE["fallback_reasons"][reason] += 1
+                if x.dim() >= 1:
+                    m = int(x.reshape(-1, x.shape[-1]).shape[0])
+                    k = int(x.shape[-1])
+                    _PROFILE["fallback_shapes"][_shape_key(m, k, self.out_features)] += 1
+                _record_elapsed("fallback_total", profile_start)
             bias = self.bias if self._had_bias else None
             return F.linear(x, self.fp_weight, bias)
         shape = x.shape
@@ -194,14 +283,45 @@ class TileLangPostScaleInt8Linear(torch.nn.Module):
             m = padded_m
             use_padded_m = True
         if m % 128 != 0 or k % 128 != 0 or self.out_features % 128 != 0:
+            if _profile_enabled():
+                _PROFILE["calls"] += 1
+                _PROFILE["fallback_calls"] += 1
+                reason = []
+                if m % 128 != 0:
+                    reason.append("m")
+                if k % 128 != 0:
+                    reason.append("k")
+                if self.out_features % 128 != 0:
+                    reason.append("n")
+                reason_key = "not_divisible_" + "_".join(reason)
+                _PROFILE["fallback_reasons"][reason_key] += 1
+                _PROFILE["fallback_shapes"][_shape_key(m, k, self.out_features)] += 1
+                _record_elapsed("fallback_total", profile_start)
             bias = self.bias if self._had_bias else None
             return F.linear(x, self.fp_weight, bias)
+        if _profile_enabled():
+            _PROFILE["calls"] += 1
+            _PROFILE["tilelang_calls"] += 1
+            _PROFILE["input_shapes"][_shape_key(original_m, k, self.out_features)] += 1
+            _PROFILE["tilelang_shapes"][_shape_key(m, k, self.out_features)] += 1
+            _PROFILE["kernel_params"][str(self._effective_kernel_params(m, k))] += 1
+        if _profile_events_enabled():
+            torch.cuda.synchronize(x_2d.device)
+            q_start = time.perf_counter()
         x_q_buf, x_s_buf = _row_quant_workspace(x_2d)
         x_q, x_s = row_quant_int8(x_2d, x_q_buf, x_s_buf)
+        if _profile_events_enabled():
+            torch.cuda.synchronize(x_2d.device)
+            _record_elapsed("row_quant", q_start)
+            gemm_start = time.perf_counter()
         y = torch.empty((m, self.out_features), dtype=torch.bfloat16, device=x_2d.device)
         self._kernel(m, k)(x_q, self.int8_weight, y, x_s, self.scale, self.bias)
+        if _profile_events_enabled():
+            torch.cuda.synchronize(x_2d.device)
+            _record_elapsed("tilelang_gemm", gemm_start)
         if use_padded_m:
             y = y[:original_m]
+        _record_elapsed("tilelang_total", profile_start)
         return y.reshape(*shape[:-1], self.out_features)
 
     @classmethod

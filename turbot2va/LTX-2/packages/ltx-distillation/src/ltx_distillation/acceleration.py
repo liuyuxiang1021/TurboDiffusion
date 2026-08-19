@@ -7,8 +7,11 @@ import math
 import os
 import re
 import sys
+import time
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 from pathlib import Path
 
 import torch
@@ -35,6 +38,41 @@ _TD_W8A8_OPS: tuple[
     Callable[..., object],
     Callable[..., object],
 ] | None = None
+_SAGESLA_PROFILE: dict[str, Any] = {
+    "calls": 0,
+    "shapes": Counter(),
+    "effective_topk": Counter(),
+    "arch": Counter(),
+    "elapsed_seconds": defaultdict(float),
+}
+
+
+def _accel_profile_enabled() -> bool:
+    return os.environ.get("TURBOT2AV_PROFILE_ACCEL", "").lower() in {"1", "true", "yes"}
+
+
+def _accel_profile_events_enabled() -> bool:
+    return os.environ.get("TURBOT2AV_PROFILE_CUDA_EVENTS", "").lower() in {"1", "true", "yes"}
+
+
+def reset_acceleration_profile() -> None:
+    _SAGESLA_PROFILE["calls"] = 0
+    _SAGESLA_PROFILE["shapes"].clear()
+    _SAGESLA_PROFILE["effective_topk"].clear()
+    _SAGESLA_PROFILE["arch"].clear()
+    _SAGESLA_PROFILE["elapsed_seconds"].clear()
+
+
+def acceleration_profile_snapshot() -> dict[str, Any]:
+    return {
+        "sagesla": {
+            "calls": _SAGESLA_PROFILE["calls"],
+            "shapes": dict(_SAGESLA_PROFILE["shapes"].most_common()),
+            "effective_topk": dict(_SAGESLA_PROFILE["effective_topk"].most_common()),
+            "arch": dict(_SAGESLA_PROFILE["arch"].most_common()),
+            "elapsed_seconds": dict(_SAGESLA_PROFILE["elapsed_seconds"]),
+        }
+    }
 
 
 @dataclass(frozen=True)
@@ -246,6 +284,22 @@ class LTXSageSLAAttention(torch.nn.Module):
     def _skip_zero_linear_enabled() -> bool:
         return os.environ.get("TURBOT2AV_SLA_SKIP_ZERO_LINEAR", "1").lower() not in {"0", "false", "no"}
 
+    @staticmethod
+    def _sage2pp_enabled(sla_core: object) -> bool:
+        accum = os.environ.get("TURBOT2AV_SAGESLA_ACCUM", "").strip().lower()
+        if accum in {"f32", "fp32", "float32"}:
+            return False
+        if accum in {"f16", "fp16", "float16"}:
+            return True
+        if torch.cuda.is_available():
+            try:
+                major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+                if major >= 12:
+                    return False
+            except Exception:
+                pass
+        return bool(getattr(sla_core, "SAGE2PP_ENABLED", False))
+
     def _should_skip_zero_linear(self) -> bool:
         if not self._skip_zero_linear_enabled():
             return False
@@ -340,7 +394,7 @@ class LTXSageSLAAttention(torch.nn.Module):
                 )
             else:
                 pvthreshold = torch.full((q.shape[-3],), 1e6, dtype=torch.float32, device=q.device)
-                if sla_core.SAGE2PP_ENABLED:
+                if self._sage2pp_enabled(sla_core):
                     sla_core.qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
                         q_int8,
                         k_int8,
@@ -393,11 +447,21 @@ class LTXSageSLAAttention(torch.nn.Module):
                 "Use --attention_scope self."
             )
 
+        profile_start = time.perf_counter()
         batch, _, inner_dim = q.shape
         head_dim = inner_dim // heads
         q, k, v = (tensor.view(batch, -1, heads, head_dim).contiguous() for tensor in (q, k, v))
         key_blocks = max(1, math.ceil(k.shape[1] / self._block_k_for_device(k.device)))
         effective_topk = max(self.requested_topk, 1.0 / key_blocks)
+        if _accel_profile_enabled():
+            _SAGESLA_PROFILE["calls"] += 1
+            _SAGESLA_PROFILE["shapes"][f"q={q.shape[1]},k={k.shape[1]},h={heads},d={head_dim}"] += 1
+            _SAGESLA_PROFILE["effective_topk"][f"{effective_topk:g}"] += 1
+            if k.device.type == "cuda":
+                _SAGESLA_PROFILE["arch"][str(torch.cuda.get_device_capability(k.device))] += 1
+        if _accel_profile_events_enabled() and q.is_cuda:
+            torch.cuda.synchronize(q.device)
+            profile_start = time.perf_counter()
         original_topk = self.local_attn.topk
         self.local_attn.topk = effective_topk
         try:
@@ -407,6 +471,9 @@ class LTXSageSLAAttention(torch.nn.Module):
                 out = self.local_attn(q, k, v)
         finally:
             self.local_attn.topk = original_topk
+        if _accel_profile_events_enabled() and out.is_cuda:
+            torch.cuda.synchronize(out.device)
+            _SAGESLA_PROFILE["elapsed_seconds"]["forward"] += time.perf_counter() - profile_start
         return out.reshape(batch, -1, inner_dim)
 
 

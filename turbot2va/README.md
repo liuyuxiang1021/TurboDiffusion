@@ -112,6 +112,7 @@ Run the following commands from `TurboDiffusion/TurboT2AV/LTX-2`:
 ```bash
 export TURBO_CHECKPOINT_PATH=/path/to/ltx-2-19b-dev.safetensors
 export TURBO_GEMMA_PATH=/path/to/gemma-3-12b-it-qat-q4_0-unquantized
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH=../..:../../turbodiffusion:$PYTHONPATH
 ```
 
@@ -135,6 +136,7 @@ CUDA_VISIBLE_DEVICES=0 pixi run python -m ltx_distillation.tools.run_av_inferenc
   --attention_scope self \
   --sla_topk 0.3 \
   --trim_text_context \
+  --preencode_text \
   --fast_norm \
   --quant_linear \
   --quant_linear_scope all \
