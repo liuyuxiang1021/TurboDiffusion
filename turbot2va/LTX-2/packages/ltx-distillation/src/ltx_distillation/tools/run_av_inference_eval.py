@@ -200,6 +200,44 @@ def _accel_profile_snapshot_if_enabled() -> dict[str, Any] | None:
     return snapshot
 
 
+def _export_torch_profile(prof: torch.profiler.profile, output_dir: str, sample_stem: str) -> None:
+    profile_dir = os.path.join(output_dir, "torch_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    trace_path = os.path.join(profile_dir, f"{sample_stem}.json")
+    table_path = os.path.join(profile_dir, f"{sample_stem}.table.txt")
+    events_path = os.path.join(profile_dir, f"{sample_stem}.events.json")
+    prof.export_chrome_trace(trace_path)
+    table = prof.key_averages(group_by_input_shape=True).table(
+        sort_by="cuda_time_total",
+        row_limit=int(os.environ.get("TURBOT2AV_TORCH_PROFILE_ROWS", "80")),
+    )
+    with open(table_path, "w", encoding="utf-8") as f:
+        f.write(table)
+    events = []
+    for item in prof.key_averages(group_by_input_shape=True):
+        self_cuda_time_total = getattr(item, "self_cuda_time_total", None)
+        if self_cuda_time_total is None:
+            self_cuda_time_total = getattr(item, "self_device_time_total", 0.0)
+        cuda_time_total = getattr(item, "cuda_time_total", None)
+        if cuda_time_total is None:
+            cuda_time_total = getattr(item, "device_time_total", 0.0)
+        events.append(
+            {
+                "key": item.key,
+                "count": item.count,
+                "input_shapes": str(getattr(item, "input_shapes", "")),
+                "self_cpu_time_total": item.self_cpu_time_total,
+                "cpu_time_total": item.cpu_time_total,
+                "self_cuda_time_total": self_cuda_time_total,
+                "cuda_time_total": cuda_time_total,
+            }
+        )
+    events.sort(key=lambda row: row["cuda_time_total"], reverse=True)
+    with open(events_path, "w", encoding="utf-8") as f:
+        json.dump(events, f, indent=2)
+    print(f"[AVEval][torch_profile] wrote {profile_dir}", flush=True)
+
+
 def _make_registry(cache_state_dicts: bool):
     if cache_state_dicts:
         return StateDictRegistry()
@@ -921,12 +959,29 @@ def main() -> None:
                         conditional_dict=sample_conditioning,
                     )
 
-                video_latent, audio_latent = run_generator_sample(conditional_dict)
+                profile_this_sample = _env_flag("TURBOT2AV_TORCH_PROFILE", False) and not any(
+                    "torch_profile" in record for record in timing_records
+                )
+                if profile_this_sample:
+                    with torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=False,
+                    ) as prof:
+                        video_latent, audio_latent = run_generator_sample(conditional_dict)
+                    _export_torch_profile(prof, args.output_dir, sample_stem)
+                    torch_profile_dir = os.path.join(args.output_dir, "torch_profile")
+                else:
+                    video_latent, audio_latent = run_generator_sample(conditional_dict)
+                    torch_profile_dir = None
                 torch.cuda.synchronize(device)
                 gen_elapsed = time.perf_counter() - gen_start
 
-            timing_records.append(
-                {
+            timing_record = {
                     "index": prompt_idx,
                     "seed": prompt_seed,
                     "seed_idx": seed_idx,
@@ -941,8 +996,10 @@ def main() -> None:
                     "quant_linear_scope": args.quant_linear_scope,
                     "quant_linear_backend": args.quant_linear_backend,
                     "generator_seconds": gen_elapsed,
-                }
-            )
+            }
+            if torch_profile_dir is not None:
+                timing_record["torch_profile"] = torch_profile_dir
+            timing_records.append(timing_record)
 
             if args.skip_decode:
                 del video_latent, audio_latent

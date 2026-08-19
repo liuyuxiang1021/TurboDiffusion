@@ -21,6 +21,23 @@ class _DummyTextEncoder(torch.nn.Module):
         return SimpleNamespace(video_encoding=video, audio_encoding=audio, attention_mask=mask)
 
 
+class _DummyTokenizer:
+    def tokenize_with_weights(self, text: str) -> dict[str, list[tuple[int, int]]]:
+        del text
+        return {"gemma": [(1, 1), (2, 1), (3, 0), (4, 0)]}
+
+
+class _DummyGemmaConnectorTextEncoder(torch.nn.Module):
+    tokenizer = _DummyTokenizer()
+
+    def forward(self, text: str, padding_side: str) -> SimpleNamespace:
+        del text, padding_side
+        video = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+        audio = video + 100
+        mask = torch.ones((1, 4), dtype=torch.int64)
+        return SimpleNamespace(video_encoding=video, audio_encoding=audio, attention_mask=mask)
+
+
 def test_text_context_trimming_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TURBOT2AV_TRIM_TEXT_CONTEXT", raising=False)
     wrapper = GemmaTextEncoderWrapper(_DummyTextEncoder())
@@ -39,6 +56,20 @@ def test_text_context_trimming_is_explicit(monkeypatch: pytest.MonkeyPatch) -> N
     result = wrapper(["prompt"])
 
     expected_video = torch.tensor([[[2.0, 3.0], [4.0, 5.0]]])
+    assert torch.equal(result["video_context"], expected_video)
+    assert torch.equal(result["audio_context"], expected_video + 100)
+    assert result["attention_mask"] is None
+
+
+def test_text_context_trimming_uses_original_token_length_for_gemma_registers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TURBOT2AV_TRIM_TEXT_CONTEXT", "1")
+    wrapper = GemmaTextEncoderWrapper(_DummyGemmaConnectorTextEncoder())
+
+    result = wrapper(["prompt"])
+
+    expected_video = torch.tensor([[[0.0, 1.0], [2.0, 3.0]]])
     assert torch.equal(result["video_context"], expected_video)
     assert torch.equal(result["audio_context"], expected_video + 100)
     assert result["attention_mask"] is None

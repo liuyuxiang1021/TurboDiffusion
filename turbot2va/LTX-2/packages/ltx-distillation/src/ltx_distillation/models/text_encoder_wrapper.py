@@ -62,14 +62,23 @@ class GemmaTextEncoderWrapper(nn.Module):
         video_contexts = []
         audio_contexts = []
         attention_masks = []
+        raw_valid_lengths = []
 
         for prompt in text_prompts:
+            raw_valid_length = None
+            if os.environ.get("TURBOT2AV_TRIM_TEXT_CONTEXT", "0").lower() not in {"0", "false", "no"}:
+                tokenizer = getattr(self.text_encoder, "tokenizer", None)
+                if tokenizer is not None:
+                    token_pairs = tokenizer.tokenize_with_weights(prompt)["gemma"]
+                    raw_valid_length = sum(attn for _, attn in token_pairs)
+
             # Forward through text encoder
             output = self.text_encoder(text=prompt, padding_side=padding_side)
 
             video_contexts.append(output.video_encoding)
             audio_contexts.append(output.audio_encoding)
             attention_masks.append(output.attention_mask)
+            raw_valid_lengths.append(raw_valid_length)
 
         # Stack batch
         video_context = torch.cat(video_contexts, dim=0)
@@ -79,10 +88,21 @@ class GemmaTextEncoderWrapper(nn.Module):
             os.environ.get("TURBOT2AV_TRIM_TEXT_CONTEXT", "0").lower() not in {"0", "false", "no"}
             and attention_mask.shape[0] == 1
         ):
-            valid_tokens = attention_mask[0].bool()
-            if valid_tokens.any():
-                video_context = video_context[:, valid_tokens, :]
-                audio_context = audio_context[:, valid_tokens, :]
+            # The Gemma connector replaces padding with learnable registers and
+            # returns an all-valid mask. With the default left padding, valid
+            # text tokens are compacted to the beginning of the connector output
+            # and register slots occupy the tail, so trim by the original token
+            # count instead of by the post-connector mask.
+            valid_length = raw_valid_lengths[0]
+            if valid_length is None:
+                valid_tokens = attention_mask[0].bool()
+                if valid_tokens.any():
+                    video_context = video_context[:, valid_tokens, :]
+                    audio_context = audio_context[:, valid_tokens, :]
+                    attention_mask = None
+            elif 0 < valid_length < video_context.shape[1]:
+                video_context = video_context[:, :valid_length, :]
+                audio_context = audio_context[:, :valid_length, :]
                 attention_mask = None
 
         return {
