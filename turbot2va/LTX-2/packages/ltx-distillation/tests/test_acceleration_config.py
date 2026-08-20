@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from ltx_distillation.acceleration import (
+    _attention_name_in_scope,
+    _effective_sla_topk,
     _linear_name_in_quant_scope,
     _parse_sla_topk_schedule,
     _scheduled_sla_topk,
@@ -61,7 +63,7 @@ def test_text_context_trimming_is_explicit(monkeypatch: pytest.MonkeyPatch) -> N
     assert result["attention_mask"] is None
 
 
-def test_text_context_trimming_uses_original_token_length_for_gemma_registers(
+def test_text_context_trimming_preserves_valid_gemma_registers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TURBOT2AV_TRIM_TEXT_CONTEXT", "1")
@@ -69,7 +71,7 @@ def test_text_context_trimming_uses_original_token_length_for_gemma_registers(
 
     result = wrapper(["prompt"])
 
-    expected_video = torch.tensor([[[0.0, 1.0], [2.0, 3.0]]])
+    expected_video = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
     assert torch.equal(result["video_context"], expected_video)
     assert torch.equal(result["audio_context"], expected_video + 100)
     assert result["attention_mask"] is None
@@ -82,6 +84,24 @@ def test_sla_topk_schedule_selects_matching_layers() -> None:
     assert _scheduled_sla_topk("model.transformer_blocks.20.attn1", 0.5, schedule) == 0.3
     assert _scheduled_sla_topk("model.transformer_blocks.40.attn1", 0.5, schedule) == 0.25
     assert _scheduled_sla_topk("model.transformer_blocks.35.attn1", 0.5, schedule) == 0.5
+
+
+def test_attention_scopes_separate_video_and_audio_self_attention() -> None:
+    video = "model.transformer_blocks.0.attn1"
+    audio = "model.transformer_blocks.0.audio_attn1"
+
+    assert _attention_name_in_scope(video, "video_self")
+    assert not _attention_name_in_scope(audio, "video_self")
+    assert _attention_name_in_scope(audio, "audio_self")
+    assert not _attention_name_in_scope(video, "audio_self")
+    assert _attention_name_in_scope(video, "self")
+    assert _attention_name_in_scope(audio, "self")
+
+
+def test_sla_short_audio_sequence_stays_dense_across_block_geometries() -> None:
+    assert _effective_sla_topk(126, 0.3, 128) == 1.0
+    assert _effective_sla_topk(126, 0.3, 64) == 1.0
+    assert _effective_sla_topk(1024, 0.3, 64) == 0.3
 
 
 @pytest.mark.parametrize(

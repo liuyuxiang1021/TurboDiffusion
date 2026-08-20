@@ -19,7 +19,7 @@ import torch
 from ltx_core.model.transformer.attention import Attention
 
 ATTENTION_TYPES = ("default", "sageattn", "sla", "sagesla")
-ATTENTION_SCOPES = ("self", "video_self", "self_av")
+ATTENTION_SCOPES = ("self", "video_self", "audio_self", "self_av")
 QUANT_LINEAR_SCOPES = (
     "all",
     "transformer_blocks",
@@ -45,6 +45,25 @@ _SAGESLA_PROFILE: dict[str, Any] = {
     "arch": Counter(),
     "elapsed_seconds": defaultdict(float),
 }
+
+
+def _dense_attention_from_ltx_layout(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch: int,
+    heads: int,
+    head_dim: int,
+    inner_dim: int,
+) -> torch.Tensor:
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    return out.transpose(1, 2).reshape(batch, -1, inner_dim)
 
 
 def _accel_profile_enabled() -> bool:
@@ -205,6 +224,19 @@ class SageAttentionCallable(torch.nn.Module):
         return out.transpose(1, 2).reshape(batch, -1, inner_dim)
 
 
+_SLA_SHORT_SEQUENCE_DENSE_LENGTH = 128
+
+
+def _effective_sla_topk(kv_length: int, requested_topk: float, block_k: int) -> float:
+    # SM90 uses 128-token key blocks, so LTX-2's 126-token audio path is
+    # dense-equivalent there. Preserve that behavior on architectures whose
+    # kernels use smaller blocks instead of pruning half of the audio context.
+    if kv_length <= _SLA_SHORT_SEQUENCE_DENSE_LENGTH:
+        return 1.0
+    key_blocks = max(1, math.ceil(kv_length / block_k))
+    return max(requested_topk, 1.0 / key_blocks)
+
+
 class LTXSLAAttention(torch.nn.Module):
     """Adapter from LTX attention tensors to TurboDiffusion's vendored SLA."""
 
@@ -247,8 +279,9 @@ class LTXSLAAttention(torch.nn.Module):
         batch, _, inner_dim = q.shape
         head_dim = inner_dim // heads
         q, k, v = (tensor.view(batch, -1, heads, head_dim).contiguous() for tensor in (q, k, v))
-        key_blocks = max(1, math.ceil(k.shape[1] / self.block_k))
-        effective_topk = max(self.requested_topk, 1.0 / key_blocks)
+        effective_topk = _effective_sla_topk(k.shape[1], self.requested_topk, self.block_k)
+        if effective_topk >= 1.0:
+            return _dense_attention_from_ltx_layout(q, k, v, batch, heads, head_dim, inner_dim)
         original_topk = self.local_attn.topk
         self.local_attn.topk = effective_topk
         try:
@@ -451,8 +484,13 @@ class LTXSageSLAAttention(torch.nn.Module):
         batch, _, inner_dim = q.shape
         head_dim = inner_dim // heads
         q, k, v = (tensor.view(batch, -1, heads, head_dim).contiguous() for tensor in (q, k, v))
-        key_blocks = max(1, math.ceil(k.shape[1] / self._block_k_for_device(k.device)))
-        effective_topk = max(self.requested_topk, 1.0 / key_blocks)
+        effective_topk = _effective_sla_topk(
+            k.shape[1],
+            self.requested_topk,
+            self._block_k_for_device(k.device),
+        )
+        if effective_topk >= 1.0:
+            return _dense_attention_from_ltx_layout(q, k, v, batch, heads, head_dim, inner_dim)
         if _accel_profile_enabled():
             _SAGESLA_PROFILE["calls"] += 1
             _SAGESLA_PROFILE["shapes"][f"q={q.shape[1]},k={k.shape[1]},h={heads},d={head_dim}"] += 1
@@ -485,6 +523,10 @@ def _is_video_self_attention_name(name: str) -> bool:
     return name.endswith(".attn1") or name == "attn1"
 
 
+def _is_audio_self_attention_name(name: str) -> bool:
+    return name.endswith("audio_attn1")
+
+
 def _is_av_cross_attention_name(name: str) -> bool:
     return name.endswith(("audio_to_video_attn", "video_to_audio_attn"))
 
@@ -494,6 +536,8 @@ def _attention_name_in_scope(name: str, attention_scope: str) -> bool:
         return _is_self_attention_name(name)
     if attention_scope == "video_self":
         return _is_video_self_attention_name(name)
+    if attention_scope == "audio_self":
+        return _is_audio_self_attention_name(name)
     if attention_scope == "self_av":
         return _is_self_attention_name(name) or _is_av_cross_attention_name(name)
     raise ValueError(f"Unsupported attention_scope: {attention_scope}")
