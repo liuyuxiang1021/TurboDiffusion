@@ -979,13 +979,11 @@ def main() -> None:
 
             mp4_path = os.path.join(args.output_dir, f"{sample_stem}.mp4")
             wav_path = os.path.join(args.output_dir, f"{sample_stem}.wav")
+            latent_path = os.path.join(args.output_dir, "latents", f"{sample_stem}.pt")
             completed_tasks += 1
-            if (
-                not args.skip_decode
-                and not args.overwrite
-                and os.path.exists(mp4_path)
-                and os.path.exists(wav_path)
-            ):
+            media_exists = not args.skip_decode and os.path.exists(mp4_path) and os.path.exists(wav_path)
+            latent_exists = args.skip_decode and args.save_latents and os.path.exists(latent_path)
+            if not args.overwrite and (media_exists or latent_exists):
                 print(
                     f"[AVEval] skip existing index={prompt_idx} seed_idx={seed_idx} "
                     f"({completed_tasks}/{total_tasks})",
@@ -1070,9 +1068,7 @@ def main() -> None:
             timing_records.append(timing_record)
 
             if args.save_latents:
-                latent_dir = os.path.join(args.output_dir, "latents")
-                os.makedirs(latent_dir, exist_ok=True)
-                latent_path = os.path.join(latent_dir, f"{sample_stem}.pt")
+                os.makedirs(os.path.dirname(latent_path), exist_ok=True)
                 torch.save(
                     {
                         "video_latent": video_latent.detach().cpu(),
