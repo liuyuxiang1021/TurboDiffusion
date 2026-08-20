@@ -311,11 +311,30 @@ def _decode_and_save_sample(
     output_dir: str,
     video_fps: int,
     audio_sample_rate: int,
-) -> None:
+    measure_stages: bool = False,
+) -> dict[str, float]:
     os.makedirs(output_dir, exist_ok=True)
 
-    video_pixel = video_vae.decode_to_pixel(video_latent)
-    audio_waveform = audio_vae.decode_to_waveform(audio_latent)
+    stage_timings: dict[str, float] = {}
+    full_start = time.perf_counter()
+    if measure_stages:
+        torch.cuda.synchronize(video_latent.device)
+        video_vae_start = time.perf_counter()
+        video_pixel = video_vae.decode_to_pixel(video_latent)
+        torch.cuda.synchronize(video_latent.device)
+        stage_timings["video_vae_seconds"] = time.perf_counter() - video_vae_start
+
+        audio_vae_start = time.perf_counter()
+        audio_waveform = audio_vae.decode_to_waveform(audio_latent)
+        torch.cuda.synchronize(audio_latent.device)
+        stage_timings["audio_vae_seconds"] = time.perf_counter() - audio_vae_start
+        stage_timings["vae_decode_seconds"] = (
+            stage_timings["video_vae_seconds"] + stage_timings["audio_vae_seconds"]
+        )
+        postprocess_start = time.perf_counter()
+    else:
+        video_pixel = video_vae.decode_to_pixel(video_latent)
+        audio_waveform = audio_vae.decode_to_waveform(audio_latent)
 
     vid = video_pixel[0]
     if vid.shape[0] == 3:
@@ -331,6 +350,9 @@ def _decode_and_save_sample(
     # Keep a separate wav even if the mp4 mux succeeds; JavisBench asserts that
     # sample_XXXX.wav exists in infer_data_dir.
     wav_float = audio_waveform[0].cpu().float()
+    if measure_stages:
+        stage_timings["postprocess_seconds"] = time.perf_counter() - postprocess_start
+        media_io_start = time.perf_counter()
     try:
         write_video(
             mp4_path,
@@ -360,8 +382,13 @@ def _decode_and_save_sample(
             ensure_ascii=False,
         )
 
+    if measure_stages:
+        stage_timings["media_io_seconds"] = time.perf_counter() - media_io_start
+        stage_timings["decode_and_io_seconds"] = time.perf_counter() - full_start
+
     del video_pixel, audio_waveform
     torch.cuda.empty_cache()
+    return stage_timings
 
 
 def _save_wav(path: str, waveform: torch.Tensor, sample_rate: int) -> None:
@@ -467,7 +494,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student_param", choices=["auto", "native_rf", "rcm_trig"], default="auto")
     parser.add_argument("--student_strict", action="store_true", default=False)
     parser.add_argument("--teacher_mode", choices=["native_rf", "rcm_trig"], default="native_rf")
-    parser.add_argument("--teacher_steps", type=int, default=50)
+    parser.add_argument("--teacher_steps", type=int, default=40)
     parser.add_argument("--num_prompts", type=int, default=None)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument(
@@ -610,6 +637,12 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark generator latency only; do not load VAE or write mp4/wav outputs.",
     )
     parser.add_argument(
+        "--save_latents",
+        action="store_true",
+        default=False,
+        help="Save generated video/audio latents for a later decode-only pass.",
+    )
+    parser.add_argument(
         "--warmup_samples",
         type=int,
         default=0,
@@ -622,6 +655,12 @@ def parse_args() -> argparse.Namespace:
         "--timing_json",
         default=None,
         help="Optional path to write per-sample generator timing records.",
+    )
+    parser.add_argument(
+        "--measure_stages",
+        action="store_true",
+        default=False,
+        help="Synchronize stage boundaries and record text, VAE, postprocess, and media I/O latency.",
     )
     parser.add_argument(
         "--video_height",
@@ -705,6 +744,8 @@ def main() -> None:
     negative_prompt = str(cfg.negative_prompt)
     preencoded_conditioning: dict[int, dict[str, torch.Tensor]] | None = None
     preencoded_unconditional: dict[str, torch.Tensor] | None = None
+    preencoded_text_seconds: dict[int, float] = {}
+    preencoded_unconditional_seconds: float | None = None
     text_encoder = None
 
     with _model_init_lock(init_lock_path, args.shard_id):
@@ -719,12 +760,23 @@ def main() -> None:
                 dtype=dtype,
                 registry=registry,
             ).eval()
-            preencoded_conditioning = {
-                prompt_idx: text_encoder(text_prompts=[prompts[prompt_idx]])
-                for prompt_idx in indices
-            }
+            preencoded_conditioning = {}
+            for prompt_idx in indices:
+                if args.measure_stages:
+                    torch.cuda.synchronize(device)
+                    text_start = time.perf_counter()
+                preencoded_conditioning[prompt_idx] = text_encoder(text_prompts=[prompts[prompt_idx]])
+                if args.measure_stages:
+                    torch.cuda.synchronize(device)
+                    preencoded_text_seconds[prompt_idx] = time.perf_counter() - text_start
             if args.model_kind == "teacher":
+                if args.measure_stages:
+                    torch.cuda.synchronize(device)
+                    text_start = time.perf_counter()
                 preencoded_unconditional = text_encoder(text_prompts=[negative_prompt])
+                if args.measure_stages:
+                    torch.cuda.synchronize(device)
+                    preencoded_unconditional_seconds = time.perf_counter() - text_start
             del text_encoder
             text_encoder = None
             gc.collect()
@@ -888,17 +940,29 @@ def main() -> None:
     timing_records: list[dict[str, Any]] = []
     for local_prompt_pos, prompt_idx in enumerate(indices, start=1):
         prompt = prompts[prompt_idx]
-        conditional_dict = (
-            preencoded_conditioning[prompt_idx]
-            if preencoded_conditioning is not None
-            else text_encoder(text_prompts=[prompt])
-        )
+        text_conditioning_seconds: float | None = preencoded_text_seconds.get(prompt_idx)
+        unconditional_text_seconds: float | None = preencoded_unconditional_seconds
+        if preencoded_conditioning is not None:
+            conditional_dict = preencoded_conditioning[prompt_idx]
+        else:
+            if args.measure_stages:
+                torch.cuda.synchronize(device)
+                text_start = time.perf_counter()
+            conditional_dict = text_encoder(text_prompts=[prompt])
+            if args.measure_stages:
+                torch.cuda.synchronize(device)
+                text_conditioning_seconds = time.perf_counter() - text_start
         if args.model_kind == "teacher":
-            unconditional_dict = (
-                preencoded_unconditional
-                if preencoded_conditioning is not None
-                else text_encoder(text_prompts=[negative_prompt])
-            )
+            if preencoded_conditioning is not None:
+                unconditional_dict = preencoded_unconditional
+            else:
+                if args.measure_stages:
+                    torch.cuda.synchronize(device)
+                    text_start = time.perf_counter()
+                unconditional_dict = text_encoder(text_prompts=[negative_prompt])
+                if args.measure_stages:
+                    torch.cuda.synchronize(device)
+                    unconditional_text_seconds = time.perf_counter() - text_start
         else:
             unconditional_dict = None
 
@@ -982,31 +1046,53 @@ def main() -> None:
                 gen_elapsed = time.perf_counter() - gen_start
 
             timing_record = {
-                    "index": prompt_idx,
-                    "seed": prompt_seed,
-                    "seed_idx": seed_idx,
-                    "sample": sample_stem,
-                    "attention_type": args.attention_type,
-                    "attention_scope": args.attention_scope,
-                    "sla_topk": args.sla_topk,
-                    "sla_topk_schedule": args.sla_topk_schedule,
-                    "fast_norm": bool(args.fast_norm),
-                    "trim_text_context": _env_flag("TURBOT2AV_TRIM_TEXT_CONTEXT", False),
-                    "quant_linear": bool(args.quant_linear),
-                    "quant_linear_scope": args.quant_linear_scope,
-                    "quant_linear_backend": args.quant_linear_backend,
-                    "generator_seconds": gen_elapsed,
+                "index": prompt_idx,
+                "seed": prompt_seed,
+                "seed_idx": seed_idx,
+                "sample": sample_stem,
+                "attention_type": args.attention_type,
+                "attention_scope": args.attention_scope,
+                "sla_topk": args.sla_topk,
+                "sla_topk_schedule": args.sla_topk_schedule,
+                "fast_norm": bool(args.fast_norm),
+                "trim_text_context": _env_flag("TURBOT2AV_TRIM_TEXT_CONTEXT", False),
+                "quant_linear": bool(args.quant_linear),
+                "quant_linear_scope": args.quant_linear_scope,
+                "quant_linear_backend": args.quant_linear_backend,
+                "generator_seconds": gen_elapsed,
             }
+            if text_conditioning_seconds is not None:
+                timing_record["text_conditioning_seconds"] = text_conditioning_seconds
+            if unconditional_text_seconds is not None:
+                timing_record["unconditional_text_seconds"] = unconditional_text_seconds
             if torch_profile_dir is not None:
                 timing_record["torch_profile"] = torch_profile_dir
             timing_records.append(timing_record)
+
+            if args.save_latents:
+                latent_dir = os.path.join(args.output_dir, "latents")
+                os.makedirs(latent_dir, exist_ok=True)
+                latent_path = os.path.join(latent_dir, f"{sample_stem}.pt")
+                torch.save(
+                    {
+                        "video_latent": video_latent.detach().cpu(),
+                        "audio_latent": audio_latent.detach().cpu(),
+                        "index": prompt_idx,
+                        "prompt": prompt,
+                        "seed": prompt_seed,
+                        "seed_idx": seed_idx,
+                        "sample": sample_stem,
+                    },
+                    latent_path,
+                )
+                timing_record["latent_path"] = latent_path
 
             if args.skip_decode:
                 del video_latent, audio_latent
             else:
                 if video_vae is None or audio_vae is None:
                     raise RuntimeError("VAE wrappers were not initialized")
-                _decode_and_save_sample(
+                decode_timings = _decode_and_save_sample(
                     video_vae=video_vae,
                     audio_vae=audio_vae,
                     video_latent=video_latent,
@@ -1019,8 +1105,24 @@ def main() -> None:
                     output_dir=args.output_dir,
                     video_fps=int(getattr(cfg, "benchmark_video_fps", 24)),
                     audio_sample_rate=int(getattr(cfg, "benchmark_audio_sample_rate", 24000)),
+                    measure_stages=args.measure_stages,
                 )
+                timing_record.update(decode_timings)
                 del video_latent, audio_latent
+
+            if args.measure_stages:
+                timing_record["stage_sum_seconds"] = sum(
+                    float(timing_record.get(key, 0.0))
+                    for key in (
+                        "text_conditioning_seconds",
+                        "generator_seconds",
+                        "decode_and_io_seconds",
+                    )
+                )
+                if unconditional_text_seconds is not None and local_prompt_pos == 1 and seed_idx == 0:
+                    timing_record["cold_start_stage_sum_seconds"] = (
+                        timing_record["stage_sum_seconds"] + unconditional_text_seconds
+                    )
 
             print(
                 f"[AVEval] {'bench' if args.skip_decode else 'saved'} "
