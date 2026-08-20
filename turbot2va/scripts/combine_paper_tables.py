@@ -64,7 +64,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Combine TurboT2VA student results into paper-style tables")
     parser.add_argument("--latent_root", type=Path, required=True)
     parser.add_argument("--javis_root", type=Path, required=True)
-    parser.add_argument("--javis_supplement_root", type=Path)
+    parser.add_argument(
+        "--javis_supplement_root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Optional metric directories to merge in command-line order; may be repeated.",
+    )
     parser.add_argument("--vbench_root", type=Path, required=True)
     parser.add_argument("--table3_root", type=Path, required=True)
     parser.add_argument("--decode_timing", type=Path)
@@ -86,8 +92,8 @@ def main() -> None:
     for config in args.configs:
         timing = timing_by_config[config]
         metrics = load_json(args.javis_root / f"{config}.json")
-        if args.javis_supplement_root:
-            metrics.update(load_json(args.javis_supplement_root / f"{config}.json"))
+        for supplement_root in args.javis_supplement_root:
+            metrics.update(load_json(supplement_root / f"{config}.json"))
         audio_metrics = load_json(args.table3_root / config / "summary.json")
 
         generator_seconds = timing.get("mean_generator_seconds")
